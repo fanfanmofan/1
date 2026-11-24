@@ -1,5 +1,8 @@
 import SwiftUI
 import AVFoundation
+import AVKit
+import ReplayKit
+import PhotosUI
 
 @main
 struct XqAssistApp: App {
@@ -8,30 +11,184 @@ struct XqAssistApp: App {
     }
 }
 
-// MARK: - 模型
+// MARK: - 画中画 (PiP) 悬浮窗管理器（切到后台后在屏幕角落显示实时最优解）
+
+final class PiPManager: NSObject, AVPictureInPictureControllerDelegate, AVPictureInPictureSampleBufferPlaybackDelegate {
+    let displayLayer = AVSampleBufferDisplayLayer()
+    private var pipController: AVPictureInPictureController?
+    private(set) var isActive = false
+
+    override init() {
+        super.init()
+        setupAudioSession()
+        displayLayer.videoGravity = .resizeAspect
+        if AVPictureInPictureController.isPictureInPictureSupported() {
+            let contentSource = AVPictureInPictureController.ContentSource(
+                sampleBufferDisplayLayer: displayLayer,
+                playbackDelegate: self
+            )
+            pipController = AVPictureInPictureController(contentSource: contentSource)
+            pipController?.delegate = self
+            pipController?.canStartPictureInPictureAutomaticallyFromInline = true
+        }
+    }
+
+    private func setupAudioSession() {
+        let session = AVAudioSession.sharedInstance()
+        try? session.setCategory(.playback, mode: .moviePlayback, options: [.mixWithOthers])
+        try? session.setActive(true)
+    }
+
+    func toggle() {
+        guard let pip = pipController else { return }
+        if pip.isPictureInPictureActive {
+            pip.stopPictureInPicture()
+        } else {
+            pip.startPictureInPicture()
+        }
+    }
+
+    func renderFrame(pos: Position, best: Move?, bestText: String, status: String) {
+        let size = CGSize(width: 450, height: 560)
+        UIGraphicsBeginImageContextWithOptions(size, true, 2.0)
+        guard let ctx = UIGraphicsGetCurrentContext() else { return }
+
+        UIColor(red: 0.12, green: 0.12, blue: 0.14, alpha: 1).setFill()
+        ctx.fill(CGRect(origin: .zero, size: size))
+
+        let titleAttr: [NSAttributedString.Key: Any] = [
+            .font: UIFont.systemFont(ofSize: 34, weight: .bold),
+            .foregroundColor: UIColor.systemGreen
+        ]
+        (bestText as NSString).draw(in: CGRect(x: 20, y: 14, width: 410, height: 42), withAttributes: titleAttr)
+
+        let subAttr: [NSAttributedString.Key: Any] = [
+            .font: UIFont.systemFont(ofSize: 18, weight: .medium),
+            .foregroundColor: UIColor.lightGray
+        ]
+        (status as NSString).draw(in: CGRect(x: 20, y: 58, width: 410, height: 26), withAttributes: subAttr)
+
+        let boardRect = CGRect(x: 25, y: 95, width: 400, height: 445)
+        UIColor(red: 0.93, green: 0.80, blue: 0.55, alpha: 1).setFill()
+        UIBezierPath(roundedRect: boardRect, cornerRadius: 10).fill()
+
+        let cellW = boardRect.width / 9.0
+        let cellH = boardRect.height / 10.0
+        func pt(_ r: Int, _ c: Int) -> CGPoint {
+            CGPoint(x: boardRect.minX + (CGFloat(c) + 0.5) * cellW,
+                    y: boardRect.minY + (CGFloat(r) + 0.5) * cellH)
+        }
+
+        ctx.setStrokeColor(UIColor.brown.cgColor)
+        ctx.setLineWidth(1.2)
+        for r in 0..<10 {
+            ctx.move(to: pt(r, 0)); ctx.addLine(to: pt(r, 8))
+        }
+        for c in 0..<9 {
+            if c == 0 || c == 8 {
+                ctx.move(to: pt(0, c)); ctx.addLine(to: pt(9, c))
+            } else {
+                ctx.move(to: pt(0, c)); ctx.addLine(to: pt(4, c))
+                ctx.move(to: pt(5, c)); ctx.addLine(to: pt(9, c))
+            }
+        }
+        ctx.strokePath()
+
+        for i in 0..<90 where pos.b[i] != 0 {
+            let v = pos.b[i]
+            let p = pt(i / 9, i % 9)
+            let rad = min(cellW, cellH) * 0.42
+            let rect = CGRect(x: p.x - rad, y: p.y - rad, width: rad * 2, height: rad * 2)
+            UIColor(red: 0.98, green: 0.93, blue: 0.8, alpha: 1).setFill()
+            ctx.fillEllipse(in: rect)
+            let col = v > 0 ? UIColor.red : UIColor.black
+            col.setStroke()
+            ctx.setLineWidth(2)
+            ctx.strokeEllipse(in: rect)
+
+            let pAttr: [NSAttributedString.Key: Any] = [
+                .font: UIFont.systemFont(ofSize: rad * 1.15, weight: .bold),
+                .foregroundColor: col
+            ]
+            let str = pieceName(v) as NSString
+            let ts = str.size(withAttributes: pAttr)
+            str.draw(at: CGPoint(x: p.x - ts.width / 2, y: p.y - ts.height / 2), withAttributes: pAttr)
+        }
+
+        if let m = best {
+            let a = pt(m.from / 9, m.from % 9), t = pt(m.to / 9, m.to % 9)
+            ctx.setStrokeColor(UIColor.systemGreen.cgColor)
+            ctx.setLineWidth(6)
+            ctx.setLineCap(.round)
+            ctx.move(to: a); ctx.addLine(to: t)
+            ctx.strokePath()
+            for q in [a, t] {
+                let rr = min(cellW, cellH) * 0.46
+                ctx.strokeEllipse(in: CGRect(x: q.x - rr, y: q.y - rr, width: rr * 2, height: rr * 2))
+            }
+        }
+
+        let image = UIGraphicsGetImageFromCurrentImageContext()
+        UIGraphicsEndImageContext()
+
+        if let cg = image?.cgImage, let sb = makeSampleBuffer(from: cg) {
+            if displayLayer.status == .failed { displayLayer.flush() }
+            displayLayer.enqueue(sb)
+        }
+    }
+
+    private func makeSampleBuffer(from cgImage: CGImage) -> CMSampleBuffer? {
+        let width = cgImage.width, height = cgImage.height
+        var pb: CVPixelBuffer?
+        let attrs = [kCVPixelBufferCGImageCompatibilityKey: true, kCVPixelBufferCGBitmapContextCompatibilityKey: true] as CFDictionary
+        CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32ARGB, attrs, &pb)
+        guard let pixelBuffer = pb else { return nil }
+
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        if let ctx = CGContext(data: CVPixelBufferGetBaseAddress(pixelBuffer), width: width, height: height,
+                               bitsPerComponent: 8, bytesPerRow: CVPixelBufferGetBytesPerRow(pixelBuffer),
+                               space: CGColorSpaceCreateDeviceRGB(),
+                               bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue) {
+            ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+        }
+        CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
+
+        var formatDesc: CMVideoFormatDescription?
+        CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: pixelBuffer, formatDescriptionOut: &formatDesc)
+        guard let desc = formatDesc else { return nil }
+
+        var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 10),
+                                        presentationTimeStamp: CMTime(seconds: CACurrentMediaTime(), preferredTimescale: 600),
+                                        decodeTimeStamp: .invalid)
+        var sb: CMSampleBuffer?
+        CMSampleBufferCreateReadyWithImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: pixelBuffer,
+                                                 formatDescription: desc, sampleTiming: &timing, sampleBufferOut: &sb)
+        return sb
+    }
+
+    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, setPlaying playing: Bool) {}
+    func pictureInPictureControllerTimeRangeForPlayback(_ pictureInPictureController: AVPictureInPictureController) -> CMTimeRange {
+        CMTimeRange(start: .zero, duration: CMTime(seconds: 3600, preferredTimescale: 600))
+    }
+    func pictureInPictureControllerIsPlaybackPaused(_ pictureInPictureController: AVPictureInPictureController) -> Bool { false }
+    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, didTransitionToRenderSize newRenderSize: CMVideoDimensions) {}
+    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, skipByInterval skipInterval: CMTime, completion completionHandler: @escaping () -> Void) { completionHandler() }
+}
+
+// MARK: - 主模型
 
 final class Model: ObservableObject {
     @Published var pos = Position.start()
     @Published var best: Move?
     @Published var bestText = "—"
-    @Published var status = "把摄像头对准整个棋盘，自动识别"
+    @Published var status = "1. 校准棋盘位置  2. 开启悬浮窗  3. 点录屏监控"
     @Published var info = ""
     @Published var live = true
-    @Published var showLabels = true
-    @Published var g2i: [Double]? = nil
-    @Published var imgSize = CGSize.zero
-    @Published var viewBoard = [Int8](repeating: 0, count: 90)
-    @Published var viewFlipped = false
-    @Published var unknown: [Int] = []
-    @Published var forceRedetect = false
+    @Published var isBroadcasting = false
+    @Published var cropRect: CGRect = SharedStore.loadCropRect()
     var editIdx = 0
-    var teachIdx = 0
 
-    let cam = CameraService()
-    private let recognizer = Recognizer()
-    private var lastRun = Date.distantPast      // 仅摄像头线程使用
-    private var pending: [Int8] = []
-    private var stable = 0
+    let pip = PiPManager()
     private var gen = 0
     private var mateFound = false
     private let engine = Engine()
@@ -39,68 +196,49 @@ final class Model: ObservableObject {
     private let mateQ = DispatchQueue(label: "xq.mate", qos: .userInitiated)
 
     init() {
-        cam.onFrame = { [weak self] pb in self?.handle(pb) }
+        registerDarwinNotification()
+        refreshPiP()
     }
 
-    // MARK: 摄像头线程：约每秒识别一次
-
-    func handle(_ pb: CVPixelBuffer) {
-        if Date().timeIntervalSince(lastRun) < 1.0 { return }
-        let s = DispatchQueue.main.sync { (live: live, force: forceRedetect) }
-        guard s.live else { return }
-        if s.force { DispatchQueue.main.async { self.forceRedetect = false } }
-        let res = recognizer.run(pb, force: s.force)
-        lastRun = Date()
-        DispatchQueue.main.async { self.consider(res) }
+    private func registerDarwinNotification() {
+        let center = CFNotificationCenterGetDarwinNotifyCenter()
+        let observer = UnsafeRawPointer(Unmanaged.passUnretained(self).toOpaque())
+        CFNotificationCenterAddObserver(center, observer, { _, obs, _, _, _ in
+            guard let obs = obs else { return }
+            let model = Unmanaged<Model>.fromOpaque(obs).takeUnretainedValue()
+            DispatchQueue.main.async { model.onRemoteBoardUpdated() }
+        }, SharedStore.darwinNotifyName as CFString, nil, .deliverImmediately)
     }
 
-    /// 用户点了摄像头画面里的某个格子，告诉 App 这是什么棋子
-    func teach(_ viewIdx: Int, _ code: Int) {
-        recognizer.teach(viewIdx: viewIdx, code: code)
-        status = "已记住，下一秒生效"
-    }
-
-    // MARK: 识别结果（主线程）：连续 2 次一致才采纳
-
-    private func consider(_ r: Recognition?) {
-        guard let r = r else {
-            g2i = nil
-            unknown = []
-            info = ""
-            status = "没找到棋盘：让整个棋盘完整进入画面，尽量正对、光线均匀"
+    private func onRemoteBoardUpdated() {
+        isBroadcasting = true
+        guard live, let payload = SharedStore.loadBoard() else { return }
+        info = payload.info
+        if payload.unknownCount > 0 {
+            status = "后台识别到 \(payload.unknownCount) 个未知棋子，请点小棋盘手动校准"
+            refreshPiP()
             return
         }
-        g2i = r.g2i
-        imgSize = CGSize(width: r.imgW, height: r.imgH)
-        viewBoard = r.viewBoard
-        viewFlipped = r.flipped
-        unknown = r.unknown
-        info = r.info
-        if !r.unknown.isEmpty {
-            stable = 0
-            pending = []
-            status = "有 \(r.unknown.count) 个棋子认不出（黄色？）：点一下它，告诉我是什么棋子"
-            return
-        }
-
-        if r.board == pending { stable += 1 } else { pending = r.board; stable = 1 }
-        guard stable >= 2, r.board != pos.b else { return }
+        guard payload.board != pos.b else { return }
 
         var np = pos
-        // 新局面恰好是上一局面走一步合法棋的结果 -> 切换走子方；否则默认轮到近端（你）这一方
         var moved = false
         for m in pos.legalMoves() {
             var t = pos
             t.make(m)
-            if t.b == r.board { moved = true; break }
+            if t.b == payload.board { moved = true; break }
         }
-        np.b = r.board
-        np.redToMove = moved ? !pos.redToMove : !r.flipped
+        np.b = payload.board
+        np.redToMove = moved ? !pos.redToMove : !payload.flipped
         pos = np
         analyze()
     }
 
-    // MARK: 手动编辑
+    func updateCropRect(_ rect: CGRect) {
+        cropRect = rect
+        SharedStore.saveCropRect(rect)
+        status = "棋盘区域已保存，后台录屏将自动按此区域裁剪"
+    }
 
     func setPiece(_ i: Int, _ code: Int) {
         live = false
@@ -122,7 +260,9 @@ final class Model: ObservableObject {
         status = "FEN 已复制"
     }
 
-    // MARK: 分析：绝杀搜索 + 云端引擎（本地引擎兜底）
+    func refreshPiP() {
+        pip.renderFrame(pos: pos, best: best, bestText: bestText, status: status)
+    }
 
     func analyze() {
         gen += 1
@@ -132,11 +272,13 @@ final class Model: ObservableObject {
         mateFound = false
         if let prob = p.validate() {
             bestText = "—"
-            status = "局面不完整/不合法：\(prob)（点右上角小棋盘可手动补全）"
+            status = "局面异常：\(prob)"
+            refreshPiP()
             return
         }
-        bestText = "分析中…"
-        status = "绝杀搜索 + 云端引擎分析中…"
+        bestText = "思考中…"
+        status = "绝杀 + 云库分析中…"
+        refreshPiP()
 
         mateQ.async { [weak self] in
             guard let self = self else { return }
@@ -161,53 +303,170 @@ final class Model: ObservableObject {
         best = mv
         bestText = (p.redToMove ? "红：" : "黑：") + p.notation(mv)
         status = note
+        refreshPiP()
     }
 
     private func runLocal(_ p: Position, _ g: Int) {
-        status = "云端不可用，使用本地引擎…"
+        status = "本地引擎计算中…"
+        refreshPiP()
         work.async { [weak self] in
             guard let self = self else { return }
             let r = self.engine.search(p, seconds: 3.0, cancelled: { [weak self] in self?.gen != g })
             DispatchQueue.main.async {
                 guard g == self.gen, !self.mateFound else { return }
                 if let (mv, _, depth) = r {
-                    self.show(mv, p, note: "本地引擎（深度\(depth)，联网后更强）")
+                    self.show(mv, p, note: "本地引擎(深度\(depth))")
                 } else {
                     self.bestText = "无棋可走"
-                    self.status = p.redToMove ? "红方已被将死/困毙" : "黑方已被将死/困毙"
+                    self.status = p.redToMove ? "红方被绝杀/困毙" : "黑方被绝杀/困毙"
+                    self.refreshPiP()
                 }
             }
         }
     }
 }
 
-// MARK: - 摄像头预览封装
+// MARK: - 系统录屏启动按钮封装
 
-struct CameraPreview: UIViewRepresentable {
-    let session: AVCaptureSession
-    let g2i: [Double]?
-    let imgSize: CGSize
-    let viewBoard: [Int8]
-    let unknown: [Int]
-    let best: Move?
-    let flipped: Bool
-    let showLabels: Bool
-    let onTapCell: (Int) -> Void
+struct BroadcastPickerView: UIViewRepresentable {
+    func makeUIView(context: Context) -> RPSystemBroadcastPickerView {
+        let picker = RPSystemBroadcastPickerView(frame: CGRect(x: 0, y: 0, width: 60, height: 60))
+        picker.preferredExtension = "com.example.xqassist.broadcast"
+        picker.showsMicrophoneButton = false
+        for sub in picker.subviews {
+            if let btn = sub as? UIButton {
+                btn.setImage(nil, for: .normal)
+                btn.setTitle("开始监控", for: .normal)
+                btn.setTitleColor(.white, for: .normal)
+                btn.titleLabel?.font = .systemFont(ofSize: 16, weight: .bold)
+            }
+        }
+        return picker
+    }
+    func updateUIView(_ uiView: RPSystemBroadcastPickerView, context: Context) {}
+}
 
-    func makeUIView(context: Context) -> PreviewUIView {
-        let v = PreviewUIView()
-        v.pl.session = session
+// MARK: - 画中画承载层视图
+
+struct PiPHostView: UIViewRepresentable {
+    let displayLayer: AVSampleBufferDisplayLayer
+    func makeUIView(context: Context) -> UIView {
+        let v = UIView()
+        displayLayer.frame = CGRect(x: 0, y: 0, width: 180, height: 224)
+        v.layer.addSublayer(displayLayer)
         return v
     }
-
-    func updateUIView(_ v: PreviewUIView, context: Context) {
-        v.onTapCell = onTapCell
-        v.update(g2i: g2i, imgSize: imgSize, viewBoard: viewBoard, unknown: unknown, best: best,
-                 flipped: flipped, showLabels: showLabels)
+    func updateUIView(_ uiView: UIView, context: Context) {
+        displayLayer.frame = uiView.bounds
     }
 }
 
-// MARK: - 棋盘绘制
+// MARK: - 棋盘区域框选校准器
+
+struct CalibrationView: View {
+    @ObservedObject var m: Model
+    @Environment(\.dismiss) private var dismiss
+    @State private var selectedItem: PhotosPickerItem?
+    @State private var screenshot: UIImage?
+    @State private var rect: CGRect = .zero
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 12) {
+                Text("导入一张象棋软件（如天天象棋）的完整截图，拖动绿框对齐棋盘外缘交叉点")
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+
+                PhotosPicker(selection: $selectedItem, matching: .screenshots) {
+                    Label("从相册选择象棋截图", systemImage: "photo.on.rectangle")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .onChange(of: selectedItem) { item in
+                    Task {
+                        if let data = try? await item?.loadTransferable(type: Data.self),
+                           let img = UIImage(data: data) {
+                            screenshot = img
+                        }
+                    }
+                }
+
+                GeometryReader { geo in
+                    ZStack {
+                        if let img = screenshot {
+                            Image(uiImage: img)
+                                .resizable()
+                                .scaledToFit()
+                                .overlay {
+                                    GeometryReader { imgGeo in
+                                        let w = imgGeo.size.width
+                                        let h = imgGeo.size.height
+                                        let box = CGRect(x: rect.minX * w, y: rect.minY * h,
+                                                         width: rect.width * w, height: rect.height * h)
+                                        Path { p in
+                                            for c in 0...8 {
+                                                let x = box.minX + CGFloat(c) / 8.0 * box.width
+                                                p.move(to: CGPoint(x: x, y: box.minY))
+                                                p.addLine(to: CGPoint(x: x, y: box.maxY))
+                                            }
+                                            for r in 0...9 {
+                                                let y = box.minY + CGFloat(r) / 9.0 * box.height
+                                                p.move(to: CGPoint(x: box.minX, y: y))
+                                                p.addLine(to: CGPoint(x: box.maxX, y: y))
+                                            }
+                                        }
+                                        .stroke(Color.green, lineWidth: 1.5)
+
+                                        Rectangle()
+                                            .fill(Color.green.opacity(0.12))
+                                            .frame(width: box.width, height: box.height)
+                                            .position(x: box.midX, y: box.midY)
+                                            .gesture(DragGesture().onChanged { v in
+                                                let nx = min(max(0, rect.minX + v.translation.width / w), 1 - rect.width)
+                                                let ny = min(max(0, rect.minY + v.translation.height / h), 1 - rect.height)
+                                                rect.origin = CGPoint(x: nx, y: ny)
+                                            })
+
+                                        Circle()
+                                            .fill(Color.green)
+                                            .frame(width: 24, height: 24)
+                                            .position(x: box.maxX, y: box.maxY)
+                                            .gesture(DragGesture().onChanged { v in
+                                                let nw = min(max(0.2, (v.location.x - box.minX) / w), 1 - rect.minX)
+                                                let nh = min(max(0.2, (v.location.y - box.minY) / h), 1 - rect.minY)
+                                                rect.size = CGSize(width: nw, height: nh)
+                                            })
+                                    }
+                                }
+                        } else {
+                            RoundedRectangle(cornerRadius: 12)
+                                .fill(Color.secondary.opacity(0.1))
+                                .overlay(Text("请先选择一张截图").foregroundColor(.secondary))
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+
+                HStack {
+                    Button("重置默认") { rect = CGRect(x: 0.05, y: 0.24, width: 0.90, height: 0.50) }
+                        .buttonStyle(.bordered)
+                    Button("保存校准区域") {
+                        m.updateCropRect(rect)
+                        dismiss()
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+            }
+            .padding()
+            .navigationTitle("校准棋盘区域")
+            .navigationBarTitleDisplayMode(.inline)
+            .onAppear { rect = m.cropRect }
+        }
+    }
+}
+
+// MARK: - 棋盘绘制 & 手动编辑器
 
 struct BoardView: View {
     let pos: Position
@@ -275,8 +534,6 @@ struct BoardView: View {
     }
 }
 
-// MARK: - 手动修正局面（点小棋盘进入）
-
 struct EditorView: View {
     @ObservedObject var m: Model
     @Environment(\.dismiss) private var dismiss
@@ -284,7 +541,7 @@ struct EditorView: View {
 
     var body: some View {
         VStack(spacing: 10) {
-            Text("点击格子修改棋子（修改后自动识别会暂停，回主界面重新打开）").font(.footnote)
+            Text("点击格子修正棋子").font(.footnote)
             Text(m.bestText).font(.title2.bold())
             BoardView(pos: m.pos, best: m.best) { idx in
                 m.editIdx = idx
@@ -313,70 +570,95 @@ struct EditorView: View {
     }
 }
 
-// MARK: - 主界面：全屏摄像头 + 叠加最佳走法
+// MARK: - 主界面
 
 struct ContentView: View {
     @StateObject private var m = Model()
     @State private var showEditor = false
-    @State private var showTeach = false
+    @State private var showCalibrate = false
 
     var body: some View {
-        ZStack {
-            CameraPreview(session: m.cam.session, g2i: m.g2i, imgSize: m.imgSize,
-                          viewBoard: m.viewBoard, unknown: m.unknown, best: m.best, flipped: m.viewFlipped,
-                          showLabels: m.showLabels,
-                          onTapCell: { idx in m.teachIdx = idx; showTeach = true })
-                .ignoresSafeArea()
-            VStack(spacing: 8) {
-                HStack(alignment: .top) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(m.bestText).font(.title2.bold()).foregroundColor(.white)
-                        Text(m.status).font(.footnote).foregroundColor(.white)
-                        if !m.info.isEmpty { Text(m.info).font(.caption).foregroundColor(.white) }
+        NavigationStack {
+            ScrollView {
+                VStack(spacing: 16) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Text(m.bestText).font(.title.bold()).foregroundColor(.green)
+                            Spacer()
+                            if m.isBroadcasting {
+                                Label("监控中", systemImage: "record.circle.fill")
+                                    .font(.caption.bold())
+                                    .foregroundColor(.red)
+                            }
+                        }
+                        Text(m.status).font(.subheadline)
+                        if !m.info.isEmpty {
+                            Text(m.info).font(.caption).foregroundColor(.secondary)
+                        }
                     }
-                    .padding(8)
-                    .background(Color.black.opacity(0.55))
-                    .cornerRadius(10)
-                    Spacer(minLength: 0)
+                    .padding()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(.secondarySystemBackground))
+                    .cornerRadius(14)
+
                     BoardView(pos: m.pos, best: m.best) { _ in showEditor = true }
-                        .frame(width: 117, height: 130)
-                        .cornerRadius(6)
-                        .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.white, lineWidth: 1))
-                }
-                .padding(.horizontal, 8)
-                Spacer()
-                VStack(spacing: 6) {
-                    HStack {
-                        Button("重新识别棋盘") { m.forceRedetect = true; m.live = true }
-                        Button(m.showLabels ? "隐藏标记" : "显示标记") { m.showLabels.toggle() }
+                        .aspectRatio(0.9, contentMode: .fit)
+                        .cornerRadius(10)
+                        .shadow(radius: 3)
+
+                    HStack(spacing: 12) {
+                        Button {
+                            m.pip.toggle()
+                        } label: {
+                            Label("开启悬浮窗", systemImage: "pip.enter")
+                                .font(.headline)
+                                .frame(maxWidth: .infinity, height: 50)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.blue)
+
+                        BroadcastPickerView()
+                            .frame(maxWidth: .infinity, height: 50)
+                            .background(Color.green)
+                            .cornerRadius(10)
                     }
-                    .buttonStyle(.bordered)
-                    .font(.footnote)
-                    HStack {
-                        Toggle("自动识别", isOn: $m.live)
-                        Picker("", selection: Binding(get: { m.pos.redToMove }, set: { m.setTurn(red: $0) })) {
-                            Text("红走").tag(true)
-                            Text("黑走").tag(false)
+
+                    VStack(spacing: 10) {
+                        HStack {
+                            Button {
+                                showCalibrate = true
+                            } label: {
+                                Label("校准棋盘位置", systemImage: "viewfinder")
+                            }
+                            .buttonStyle(.bordered)
+
+                            Spacer()
+
+                            Toggle("自动同步", isOn: $m.live)
+                                .labelsHidden()
+                            Text("自动同步").font(.footnote)
+                        }
+
+                        Picker("走子方", selection: Binding(get: { m.pos.redToMove }, set: { m.setTurn(red: $0) })) {
+                            Text("红方走").tag(true)
+                            Text("黑方走").tag(false)
                         }
                         .pickerStyle(.segmented)
                     }
-                    .font(.footnote)
+                    .padding()
+                    .background(Color(.secondarySystemBackground))
+                    .cornerRadius(14)
+
+                    PiPHostView(displayLayer: m.pip.displayLayer)
+                        .frame(width: 1, height: 1)
+                        .opacity(0.01)
                 }
-                .padding(10)
-                .background(.ultraThinMaterial)
-                .cornerRadius(14)
-                .padding(.horizontal, 8)
-                .padding(.bottom, 4)
+                .padding()
             }
-        }
-        .onAppear { m.cam.start() }
-        .sheet(isPresented: $showEditor) { EditorView(m: m) }
-        .confirmationDialog("这个格子是什么棋子？", isPresented: $showTeach, titleVisibility: .visible) {
-            ForEach([1, 2, 3, 4, 5, 6, 7, -1, -2, -3, -4, -5, -6, -7], id: \.self) { code in
-                Button((code > 0 ? "红" : "黑") + pieceName(Int8(code))) {
-                    m.teach(m.teachIdx, code)
-                }
-            }
+            .navigationTitle("象棋后台助手")
+            .navigationBarTitleDisplayMode(.inline)
+            .sheet(isPresented: $showEditor) { EditorView(m: m) }
+            .sheet(isPresented: $showCalibrate) { CalibrationView(m: m) }
         }
     }
 }
