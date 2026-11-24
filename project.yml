@@ -17,9 +17,9 @@ targets:
     sources:
       - path: .
         includes:
-          - "App.swift"
-          - "Vision.swift"
-          - "Xiangqi.swift"
+          - "*.swift"
+        excludes:
+          - "SampleHandler.swift"
     entitlements:
       path: XqAssist.entitlements
       properties:
