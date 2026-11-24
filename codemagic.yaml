@@ -1,31 +1,32 @@
 workflows:
-  xqassist:
-    name: XqAssist
-    instance_type: mac_mini_m2
-    max_build_duration: 30
-    environment:
-      xcode: latest
-    scripts:
-      - name: Generate project
-        script: |
-          brew install xcodegen
-          xcodegen generate
-      - name: Build unsigned
-        script: |
-          xcodebuild -project XqAssist.xcodeproj -scheme XqAssist \
-            -configuration Release -sdk iphoneos \
-            -destination 'generic/platform=iOS' \
-            -derivedDataPath build \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build > build.log 2>&1
-          code=$?
-          grep -E "error:" build.log | head -30
-          exit $code
-      - name: Package IPA
-        script: |
-          mkdir -p Payload
-          cp -R build/Build/Products/Release-iphoneos/XqAssist.app Payload/
-          zip -qr XqAssist.ipa Payload
-          cp XqAssist.ipa XqAssist.zip
-    artifacts:
-      - XqAssist.ipa
-      - XqAssist.zip
+ios-build-zip:
+name: Build iOS App & Extension ZIP
+max_build_duration: 30
+environment:
+xcode: latest
+scripts:
+- name: Clean accidental markdown fences & Generate Project
+script: |
+# 自动清理误粘贴进 .swift 或 .yml 文件里的 ⁠ 标记 for f in *.swift *.yml; do [ -f "$f" ] && sed -i '' '/^⁠/d' "$f"
+done
+ls -la
+brew install xcodegen
+xcodegen generate
+- name: Build Unsigned .app
+script: |
+xcodebuild build 
+-project XqAssist.xcodeproj 
+-scheme XqAssist 
+-configuration Release 
+-sdk iphoneos 
+-derivedDataPath build 
+CODE_SIGN_IDENTITY="" 
+CODE_SIGNING_REQUIRED=NO 
+CODE_SIGNING_ALLOWED=NO
+- name: Package as ZIP (IPA)
+script: |
+mkdir -p Payload
+cp -r build/Build/Products/Release-iphoneos/XqAssist.app Payload/
+zip -r XqAssist_Unsigned.zip Payload
+artifacts:
+- XqAssist_Unsigned.zip
