@@ -7,7 +7,8 @@ xcode: latest
 scripts:
 - name: Clean accidental markdown fences & Generate Project
 script: |
-# 自动清理误粘贴进 .swift 或 .yml 文件里的 ⁠ 标记 for f in *.swift *.yml; do [ -f "$f" ] && sed -i '' '/^⁠/d' "$f"
+for f in *.swift *.yml; do
+[ -f "$f" ] && sed -i '' '/^```/d' "$f"
 done
 ls -la
 brew install xcodegen
