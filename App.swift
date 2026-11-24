@@ -48,14 +48,17 @@ final class PiPManager: NSObject, AVPictureInPictureControllerDelegate, AVPictur
         }
     }
 
+    /// 将当前局面与最优走法渲染成视频帧推送到画中画窗口
     func renderFrame(pos: Position, best: Move?, bestText: String, status: String) {
         let size = CGSize(width: 450, height: 560)
         UIGraphicsBeginImageContextWithOptions(size, true, 2.0)
         guard let ctx = UIGraphicsGetCurrentContext() else { return }
 
+        // 背景
         UIColor(red: 0.12, green: 0.12, blue: 0.14, alpha: 1).setFill()
         ctx.fill(CGRect(origin: .zero, size: size))
 
+        // 顶部走法文字
         let titleAttr: [NSAttributedString.Key: Any] = [
             .font: UIFont.systemFont(ofSize: 34, weight: .bold),
             .foregroundColor: UIColor.systemGreen
@@ -68,6 +71,7 @@ final class PiPManager: NSObject, AVPictureInPictureControllerDelegate, AVPictur
         ]
         (status as NSString).draw(in: CGRect(x: 20, y: 58, width: 410, height: 26), withAttributes: subAttr)
 
+        // 绘制迷你棋盘 (y: 95 ... 545)
         let boardRect = CGRect(x: 25, y: 95, width: 400, height: 445)
         UIColor(red: 0.93, green: 0.80, blue: 0.55, alpha: 1).setFill()
         UIBezierPath(roundedRect: boardRect, cornerRadius: 10).fill()
@@ -79,6 +83,7 @@ final class PiPManager: NSObject, AVPictureInPictureControllerDelegate, AVPictur
                     y: boardRect.minY + (CGFloat(r) + 0.5) * cellH)
         }
 
+        // 棋盘网格线
         ctx.setStrokeColor(UIColor.brown.cgColor)
         ctx.setLineWidth(1.2)
         for r in 0..<10 {
@@ -94,6 +99,7 @@ final class PiPManager: NSObject, AVPictureInPictureControllerDelegate, AVPictur
         }
         ctx.strokePath()
 
+        // 棋子
         for i in 0..<90 where pos.b[i] != 0 {
             let v = pos.b[i]
             let p = pt(i / 9, i % 9)
@@ -115,6 +121,7 @@ final class PiPManager: NSObject, AVPictureInPictureControllerDelegate, AVPictur
             str.draw(at: CGPoint(x: p.x - ts.width / 2, y: p.y - ts.height / 2), withAttributes: pAttr)
         }
 
+        // 最优走法箭头
         if let m = best {
             let a = pt(m.from / 9, m.from % 9), t = pt(m.to / 9, m.to % 9)
             ctx.setStrokeColor(UIColor.systemGreen.cgColor)
@@ -200,6 +207,7 @@ final class Model: ObservableObject {
         refreshPiP()
     }
 
+    /// 监听来自 Broadcast Extension 录屏扩展的棋盘更新通知
     private func registerDarwinNotification() {
         let center = CFNotificationCenterGetDarwinNotifyCenter()
         let observer = UnsafeRawPointer(Unmanaged.passUnretained(self).toOpaque())
@@ -264,6 +272,8 @@ final class Model: ObservableObject {
         pip.renderFrame(pos: pos, best: best, bestText: bestText, status: status)
     }
 
+    // MARK: 分析：绝杀搜索 + 云端引擎（本地引擎兜底）
+
     func analyze() {
         gen += 1
         let g = gen
@@ -326,7 +336,7 @@ final class Model: ObservableObject {
     }
 }
 
-// MARK: - 系统录屏启动按钮封装
+// MARK: - 系统录屏启动按钮封装 (RPSystemBroadcastPickerView)
 
 struct BroadcastPickerView: UIViewRepresentable {
     func makeUIView(context: Context) -> RPSystemBroadcastPickerView {
@@ -361,7 +371,7 @@ struct PiPHostView: UIViewRepresentable {
     }
 }
 
-// MARK: - 棋盘区域框选校准器
+// MARK: - 棋盘区域框选校准器（导入一张象棋 App 截图框出棋盘）
 
 struct CalibrationView: View {
     @ObservedObject var m: Model
@@ -404,6 +414,7 @@ struct CalibrationView: View {
                                         let h = imgGeo.size.height
                                         let box = CGRect(x: rect.minX * w, y: rect.minY * h,
                                                          width: rect.width * w, height: rect.height * h)
+                                        // 9x10 辅助网格
                                         Path { p in
                                             for c in 0...8 {
                                                 let x = box.minX + CGFloat(c) / 8.0 * box.width
@@ -418,6 +429,7 @@ struct CalibrationView: View {
                                         }
                                         .stroke(Color.green, lineWidth: 1.5)
 
+                                        // 拖动整体位置
                                         Rectangle()
                                             .fill(Color.green.opacity(0.12))
                                             .frame(width: box.width, height: box.height)
@@ -428,6 +440,7 @@ struct CalibrationView: View {
                                                 rect.origin = CGPoint(x: nx, y: ny)
                                             })
 
+                                        // 右下角缩放手柄
                                         Circle()
                                             .fill(Color.green)
                                             .frame(width: 24, height: 24)
@@ -581,6 +594,7 @@ struct ContentView: View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 16) {
+                    // 状态卡片
                     VStack(alignment: .leading, spacing: 6) {
                         HStack {
                             Text(m.bestText).font(.title.bold()).foregroundColor(.green)
@@ -601,11 +615,13 @@ struct ContentView: View {
                     .background(Color(.secondarySystemBackground))
                     .cornerRadius(14)
 
+                    // 实时棋盘预览（点击可手动微调）
                     BoardView(pos: m.pos, best: m.best) { _ in showEditor = true }
                         .aspectRatio(0.9, contentMode: .fit)
                         .cornerRadius(10)
                         .shadow(radius: 3)
 
+                    // 核心操作区：开启悬浮窗 + 开启屏幕监控
                     HStack(spacing: 12) {
                         Button {
                             m.pip.toggle()
@@ -623,6 +639,7 @@ struct ContentView: View {
                             .cornerRadius(10)
                     }
 
+                    // 辅助设置
                     VStack(spacing: 10) {
                         HStack {
                             Button {
@@ -649,6 +666,7 @@ struct ContentView: View {
                     .background(Color(.secondarySystemBackground))
                     .cornerRadius(14)
 
+                    // 隐藏的 PiP 视频源载体
                     PiPHostView(displayLayer: m.pip.displayLayer)
                         .frame(width: 1, height: 1)
                         .opacity(0.01)
@@ -657,8 +675,12 @@ struct ContentView: View {
             }
             .navigationTitle("象棋后台助手")
             .navigationBarTitleDisplayMode(.inline)
-            .sheet(isPresented: $showEditor) { EditorView(m: m) }
-            .sheet(isPresented: $showCalibrate) { CalibrationView(m: m) }
+            .sheet(isPresented: $showEditor) {
+                EditorView(m: m)
+            }
+            .sheet(isPresented: $showCalibrate) {
+                CalibrationView(m: m)
+            }
         }
     }
 }
