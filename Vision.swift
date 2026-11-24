@@ -4,8 +4,7 @@ import CoreImage.CIFilterBuiltins
 import UIKit
 import Vision
 
-// 几何计算统一用 "k-px" = 像素 / 1000
-
+// 几何计算统一用 "k-px" = 像素 / 1000（竖直方向的相机画面坐标）
 let K: Double = 1000
 
 // MARK: - 单应性
@@ -30,33 +29,6 @@ func homography(src: [CGPoint], dst: [CGPoint]) -> [Double]? {
         }
     }
     return (0..<8).map { A[$0][8] / A[$0][$0] } + [1.0]
-}
-
-/// 多点最小二乘：src -> dst
-func fitHomography(src: [CGPoint], dst: [CGPoint]) -> [Double]? {
-    if src.count < 4 || src.count != dst.count { return nil }
-    var M = [[Double]](repeating: [Double](repeating: 0, count: 9), count: 8)
-    for i in 0..<src.count {
-        let x = Double(src[i].x), y = Double(src[i].y)
-        let X = Double(dst[i].x), Y = Double(dst[i].y)
-        let r1: [Double] = [x, y, 1, 0, 0, 0, -x * X, -y * X]
-        let r2: [Double] = [0, 0, 0, x, y, 1, -x * Y, -y * Y]
-        for a in 0..<8 {
-            for b in 0..<8 { M[a][b] += r1[a] * r1[b] + r2[a] * r2[b] }
-            M[a][8] += r1[a] * X + r2[a] * Y
-        }
-    }
-    for col in 0..<8 {
-        var piv = col
-        for r in col..<8 where abs(M[r][col]) > abs(M[piv][col]) { piv = r }
-        if abs(M[piv][col]) < 1e-12 { return nil }
-        M.swapAt(piv, col)
-        for r in 0..<8 where r != col {
-            let f = M[r][col] / M[col][col]
-            for k in col..<9 { M[r][k] -= f * M[col][k] }
-        }
-    }
-    return (0..<8).map { M[$0][8] / M[$0][$0] } + [1.0]
 }
 
 func applyH(_ h: [Double], _ x: Double, _ y: Double) -> CGPoint {
@@ -114,13 +86,13 @@ final class CameraService: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         let now = Date()
-        guard now.timeIntervalSince(last) > 0.4, let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        guard now.timeIntervalSince(last) > 0.3, let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         last = now
         onFrame?(pb)
     }
 }
 
-// MARK: - 全屏预览：叠加网格 / 识别标记 / 最佳走法箭头
+// MARK: - 全屏预览：叠加网格 / 识别标记 / 最佳走法箭头；点击格子可纠正棋子
 
 final class PreviewUIView: UIView {
     override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
@@ -131,9 +103,11 @@ final class PreviewUIView: UIView {
     private let arrowLayer = CAShapeLayer()
     private var labels: [CATextLayer] = []
 
+    var onTapCell: ((Int) -> Void)?
     private var g2i: [Double]? = nil
     private var imgSize = CGSize.zero
     private var viewBoard: [Int8] = []
+    private var unknown: [Int] = []
     private var best: Move?
     private var flipped = false
     private var showLabels = true
@@ -159,6 +133,7 @@ final class PreviewUIView: UIView {
         layer.addSublayer(gridLayer)
         layer.addSublayer(arrowOutline)
         layer.addSublayer(arrowLayer)
+        addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(tapped(_:))))
     }
     required init?(coder: NSCoder) { fatalError() }
 
@@ -167,27 +142,45 @@ final class PreviewUIView: UIView {
         redraw()
     }
 
-    func update(g2i: [Double]?, imgSize: CGSize, viewBoard: [Int8], best: Move?, flipped: Bool, showLabels: Bool) {
+    func update(g2i: [Double]?, imgSize: CGSize, viewBoard: [Int8], unknown: [Int],
+                best: Move?, flipped: Bool, showLabels: Bool) {
         self.g2i = g2i
         self.imgSize = imgSize
         self.viewBoard = viewBoard
+        self.unknown = unknown
         self.best = best
         self.flipped = flipped
         self.showLabels = showLabels
         redraw()
     }
 
+    private func scaleInfo() -> (s: Double, ox: Double, oy: Double)? {
+        let iw = Double(imgSize.width), ih = Double(imgSize.height)
+        if iw <= 0 || ih <= 0 { return nil }
+        let vw = Double(bounds.width), vh = Double(bounds.height)
+        let s = max(vw / iw, vh / ih)
+        return (s, (vw - iw * s) / 2, (vh - ih * s) / 2)
+    }
+
     /// 视图网格 (列, 行) -> 屏幕坐标（预览是 aspect-fill，竖屏正向）
     private func map(_ c: Double, _ r: Double) -> CGPoint? {
-        guard let h = g2i, imgSize.width > 0, imgSize.height > 0 else { return nil }
+        guard let h = g2i, let si = scaleInfo() else { return nil }
         let p = applyH(h, c, r)
         let x = Double(p.x) * K, y = Double(p.y) * K
         if !x.isFinite || !y.isFinite { return nil }
-        let vw = Double(bounds.width), vh = Double(bounds.height)
-        let iw = Double(imgSize.width), ih = Double(imgSize.height)
-        let s = max(vw / iw, vh / ih)
-        let ox = (vw - iw * s) / 2, oy = (vh - ih * s) / 2
-        return CGPoint(x: x * s + ox, y: y * s + oy)
+        return CGPoint(x: x * si.s + si.ox, y: y * si.s + si.oy)
+    }
+
+    @objc private func tapped(_ g: UITapGestureRecognizer) {
+        guard let h = g2i, let inv = invert3(h), let si = scaleInfo() else { return }
+        let p = g.location(in: self)
+        let x = (Double(p.x) - si.ox) / si.s / K
+        let y = (Double(p.y) - si.oy) / si.s / K
+        let q = applyH(inv, x, y)
+        let gx = Double(q.x), gy = Double(q.y)
+        if !gx.isFinite || !gy.isFinite { return }
+        let c = Int(gx.rounded()), r = Int(gy.rounded())
+        if c >= 0 && c <= 8 && r >= 0 && r <= 9 { onTapCell?(r * 9 + c) }
     }
 
     private func arrowPath(_ a: CGPoint, _ t: CGPoint) -> UIBezierPath {
@@ -225,7 +218,6 @@ final class PreviewUIView: UIView {
         }
         gridLayer.path = grid.cgPath
 
-        // 最佳走法箭头（走法是规范坐标，需要换回视图坐标）
         func vp(_ i: Int) -> CGPoint? {
             let r = i / 9, c = i % 9
             return flipped ? map(Double(8 - c), Double(9 - r)) : map(Double(c), Double(r))
@@ -239,14 +231,19 @@ final class PreviewUIView: UIView {
             arrowLayer.path = nil
         }
 
-        // 识别标记
-        var items: [(CGPoint, String, UIColor)] = []
+        var items: [(CGPoint, String, UIColor, UIColor)] = []
         if showLabels, viewBoard.count == 90 {
             for i in 0..<90 where viewBoard[i] != 0 {
                 if let p = map(Double(i % 9), Double(i / 9)) {
                     let v = viewBoard[i]
-                    items.append((p, pieceName(v), v > 0 ? UIColor.red : UIColor.black))
+                    items.append((p, pieceName(v), v > 0 ? UIColor.red : UIColor.black,
+                                  UIColor.white.withAlphaComponent(0.8)))
                 }
+            }
+        }
+        for i in unknown {
+            if let p = map(Double(i % 9), Double(i / 9)) {
+                items.append((p, "?", UIColor.black, UIColor.yellow))
             }
         }
         while labels.count < items.count {
@@ -255,7 +252,6 @@ final class PreviewUIView: UIView {
             t.alignmentMode = .center
             t.fontSize = 14
             t.cornerRadius = 10
-            t.backgroundColor = UIColor.white.withAlphaComponent(0.8).cgColor
             layer.addSublayer(t)
             labels.append(t)
         }
@@ -265,6 +261,7 @@ final class PreviewUIView: UIView {
                 t.isHidden = false
                 t.string = it.1
                 t.foregroundColor = it.2.cgColor
+                t.backgroundColor = it.3.cgColor
                 t.frame = CGRect(x: it.0.x - 10, y: it.0.y - 10, width: 20, height: 19)
             } else {
                 t.isHidden = true
@@ -279,8 +276,6 @@ struct Hit {
     var type: Int       // 1 帅 2 仕 3 相 4 马 5 车 6 炮 7 兵
     var side: Int       // 1 红, -1 黑, 0 字形无法区分
     var conf: Float
-    var x: Double       // 像素，左上角为原点
-    var y: Double
 }
 
 enum Glyph {
@@ -295,7 +290,6 @@ enum Glyph {
 
 enum OCR {
     static func run(_ cg: CGImage, minHeight: Float) -> [Hit] {
-        let W = Double(cg.width), H = Double(cg.height)
         let req = VNRecognizeTextRequest()
         req.recognitionLevel = .accurate
         req.recognitionLanguages = ["zh-Hans", "zh-Hant"]
@@ -306,16 +300,8 @@ enum OCR {
         var hits = [Hit]()
         for obs in req.results ?? [] {
             guard let cand = obs.topCandidates(1).first else { continue }
-            let s = cand.string
-            var idx = s.startIndex
-            while idx < s.endIndex {
-                let nxt = s.index(after: idx)
-                if let g = Glyph.table[s[idx]], let rect = try? cand.boundingBox(for: idx..<nxt) {
-                    let b = rect.boundingBox
-                    hits.append(Hit(type: g.0, side: g.1, conf: cand.confidence,
-                                    x: Double(b.midX) * W, y: (1 - Double(b.midY)) * H))
-                }
-                idx = nxt
+            for ch in cand.string {
+                if let g = Glyph.table[ch] { hits.append(Hit(type: g.0, side: g.1, conf: cand.confidence)) }
             }
         }
         return hits
@@ -324,12 +310,12 @@ enum OCR {
     /// 矩形候选（棋盘外框），返回 k-px 坐标，顺序 左上/右上/右下/左下
     static func rectangles(_ cg: CGImage) -> [[CGPoint]] {
         let req = VNDetectRectanglesRequest()
-        req.minimumAspectRatio = 0.6
+        req.minimumAspectRatio = 0.5
         req.maximumAspectRatio = 1.0
-        req.minimumSize = 0.2
-        req.minimumConfidence = 0.3
-        req.maximumObservations = 8
-        req.quadratureTolerance = 30
+        req.minimumSize = 0.15
+        req.minimumConfidence = 0.2
+        req.maximumObservations = 12
+        req.quadratureTolerance = 45
         let handler = VNImageRequestHandler(cgImage: cg, options: [:])
         do { try handler.perform([req]) } catch { return [] }
         let W = Double(cg.width), H = Double(cg.height)
@@ -344,82 +330,119 @@ enum OCR {
     }
 }
 
-// MARK: - 自动找棋盘：矩形候选 × 边距 → 用识别到的棋子对齐到 9x10 网格来打分
+// MARK: - 灰度图（用于对齐棋盘线）
+
+final class Gray {
+    let w: Int
+    let h: Int
+    let scale: Double
+    let d: [UInt8]
+
+    init(_ cg: CGImage, scale: Double) {
+        let ww = max(1, Int(Double(cg.width) * scale))
+        let hh = max(1, Int(Double(cg.height) * scale))
+        var data = [UInt8](repeating: 0, count: ww * hh)
+        data.withUnsafeMutableBytes { buf in
+            if let c = CGContext(data: buf.baseAddress, width: ww, height: hh, bitsPerComponent: 8,
+                                 bytesPerRow: ww, space: CGColorSpaceCreateDeviceGray(),
+                                 bitmapInfo: CGImageAlphaInfo.none.rawValue) {
+                c.interpolationQuality = .medium
+                c.draw(cg, in: CGRect(x: 0, y: 0, width: ww, height: hh))
+            }
+        }
+        self.w = ww
+        self.h = hh
+        self.scale = scale
+        self.d = data
+    }
+
+    /// 双线性取样；越界返回 -1
+    func at(_ x: Double, _ y: Double) -> Double {
+        if !(x >= 0 && y >= 0 && x < 1e6 && y < 1e6) { return -1 }
+        let xi = Int(x), yi = Int(y)
+        if xi >= w - 1 || yi >= h - 1 { return -1 }
+        let fx = x - Double(xi), fy = y - Double(yi)
+        let i0 = yi * w + xi
+        let a = Double(d[i0]), b = Double(d[i0 + 1])
+        let c = Double(d[i0 + w]), e = Double(d[i0 + w + 1])
+        let top = a + (b - a) * fx
+        let bot = c + (e - c) * fx
+        return top + (bot - top) * fy
+    }
+}
+
+// MARK: - 用棋盘线自动对齐网格（不需要棋子）
 
 enum Geo {
-    static func legal(_ t: Int, _ c: Int, _ r: Int) -> Bool {
-        switch t {
-        case 1:
-            return c >= 3 && c <= 5 && (r <= 2 || r >= 7)
-        case 2:
-            let a: Bool = c == 4 && (r == 1 || r == 8)
-            let b: Bool = (c == 3 || c == 5) && (r == 0 || r == 2 || r == 7 || r == 9)
-            return a || b
-        case 3:
-            let t1: Bool = (r == 0 || r == 4) && (c == 2 || c == 6)
-            let t2: Bool = r == 2 && (c == 0 || c == 4 || c == 8)
-            let b1: Bool = (r == 9 || r == 5) && (c == 2 || c == 6)
-            let b2: Bool = r == 7 && (c == 0 || c == 4 || c == 8)
-            return t1 || t2 || b1 || b2
-        case 7:
-            let red: Bool = r <= 6 && (r <= 4 || c % 2 == 0)
-            let black: Bool = r >= 3 && (r >= 5 || c % 2 == 0)
-            return red || black
-        default:
-            return true
-        }
-    }
+    static let gridCorners = [CGPoint(x: 0, y: 0), CGPoint(x: 8, y: 0), CGPoint(x: 8, y: 9), CGPoint(x: 0, y: 9)]
 
-    /// 返回 (内点数, 综合分)
-    static func score(_ h: [Double], _ hits: [Hit], tol: Double = 0.25) -> (Int, Int) {
-        var inl = 0, leg = 0
-        for ht in hits {
-            let p = applyH(h, ht.x / K, ht.y / K)
-            let gx = Double(p.x), gy = Double(p.y)
-            if !gx.isFinite || !gy.isFinite { continue }
-            let c = Int(gx.rounded()), r = Int(gy.rounded())
-            let dx = abs(gx - Double(c)), dy = abs(gy - Double(r))
-            if dx < tol && dy < tol && c >= 0 && c <= 8 && r >= 0 && r <= 9 {
-                inl += 1
-                leg += legal(ht.type, c, r) ? 1 : -2
+    /// 网格四角（k-px）对应的棋盘线"暗线对比度"，越大越贴合
+    static func objective(_ G: Gray, _ corners: [CGPoint], shift: Double = 0) -> Double {
+        guard let h = homography(src: gridCorners, dst: corners) else { return 0 }
+        let f = K * G.scale
+        let d = 0.13
+        var total = 0.0
+        var cnt = 0
+        func lum(_ c: Double, _ r: Double) -> Double {
+            let p = applyH(h, c, r)
+            return G.at(Double(p.x) * f, Double(p.y) * f)
+        }
+        func add(_ c: Double, _ r: Double, vertical: Bool) {
+            let v0 = lum(c, r)
+            let v1 = vertical ? lum(c - d, r) : lum(c, r - d)
+            let v2 = vertical ? lum(c + d, r) : lum(c, r + d)
+            if v0 < 0 || v1 < 0 || v2 < 0 { return }
+            cnt += 1
+            let ct = (v1 + v2) / 2 - v0
+            if ct > 0 { total += ct }
+        }
+        let nv = 36, nh = 32
+        for ci in 0...8 {
+            let cc = Double(ci) + shift
+            for k in 0..<nv {
+                let r = (Double(k) + 0.5) / Double(nv) * 9
+                if ci >= 1 && ci <= 7 && r > 4 && r < 5 { continue }      // 楚河汉界处没有竖线
+                add(cc, r, vertical: true)
             }
         }
-        return (inl, inl * 10 + leg)
+        for ri in 0...9 {
+            let rr = Double(ri) + shift
+            for k in 0..<nh { add((Double(k) + 0.5) / Double(nh) * 8, rr, vertical: false) }
+        }
+        return cnt > 0 ? total / Double(cnt) : 0
     }
 
-    static func refine(_ h: [Double], _ hits: [Hit]) -> [Double] {
-        var cur = h
-        var curScore = score(cur, hits).1
-        for _ in 0..<3 {
-            var src = [CGPoint](), dst = [CGPoint]()
-            var cs = Set<Int>(), rs = Set<Int>()
-            for ht in hits {
-                let p = applyH(cur, ht.x / K, ht.y / K)
-                let gx = Double(p.x), gy = Double(p.y)
-                if !gx.isFinite || !gy.isFinite { continue }
-                let c = Int(gx.rounded()), r = Int(gy.rounded())
-                let dx = abs(gx - Double(c)), dy = abs(gy - Double(r))
-                if dx < 0.4 && dy < 0.4 && c >= 0 && c <= 8 && r >= 0 && r <= 9 {
-                    src.append(CGPoint(x: ht.x / K, y: ht.y / K))
-                    dst.append(CGPoint(x: c, y: r))
-                    cs.insert(c); rs.insert(r)
+    /// 坐标下降：逐个角点上下左右微调，步长逐级减半
+    static func refine(_ G: Gray, _ start: [CGPoint], step0: Double) -> ([CGPoint], Double) {
+        var p = start
+        var best = objective(G, p)
+        var step = step0
+        while step > 0.0015 {
+            var improved = true
+            var iters = 0
+            while improved && iters < 6 {
+                improved = false
+                iters += 1
+                for i in 0..<4 {
+                    for axis in 0..<2 {
+                        for sgn in [-1.0, 1.0] {
+                            var q = p
+                            if axis == 0 { q[i].x += CGFloat(sgn * step) } else { q[i].y += CGFloat(sgn * step) }
+                            let v = objective(G, q)
+                            if v > best { best = v; p = q; improved = true }
+                        }
+                    }
                 }
             }
-            if src.count < 6 || cs.count < 3 || rs.count < 3 { break }
-            guard let nh = fitHomography(src: src, dst: dst) else { break }
-            let ns = score(nh, hits).1
-            if ns >= curScore { cur = nh; curScore = ns } else { break }
+            step *= 0.5
         }
-        return cur
+        return (p, best)
     }
 
-    /// 返回 (网格->图像, 图像->网格)
-    static func find(quads: [[CGPoint]], hits: [Hit]) -> ([Double], [Double])? {
-        if hits.count < 5 { return nil }
-        let dstGrid = [CGPoint(x: 0, y: 0), CGPoint(x: 8, y: 0), CGPoint(x: 8, y: 9), CGPoint(x: 0, y: 9)]
-        var hyps = [[Double]]()
+    static func hypotheses(quads: [[CGPoint]], imgW: Double, imgH: Double) -> [[CGPoint]] {
+        var out = [[CGPoint]]()
         for q in quads where q.count == 4 {
-            for a in [0.0, 0.3, 0.5, 0.7, 0.9, 1.2] {
+            for a in [0.0, 0.4, 0.6, 0.8, 1.0, 1.3] {
                 let mx = a / (8 + 2 * a), my = a / (9 + 2 * a)
                 func bil(_ u: Double, _ v: Double) -> CGPoint {
                     let w0 = (1 - u) * (1 - v), w1 = u * (1 - v), w2 = u * v, w3 = (1 - u) * v
@@ -433,37 +456,47 @@ enum Geo {
                     y += w3 * Double(q[3].y)
                     return CGPoint(x: x, y: y)
                 }
-                let src = [bil(mx, my), bil(1 - mx, my), bil(1 - mx, 1 - my), bil(mx, 1 - my)]
-                if let h = homography(src: src, dst: dstGrid) { hyps.append(h) }
+                out.append([bil(mx, my), bil(1 - mx, my), bil(1 - mx, 1 - my), bil(mx, 1 - my)])
             }
         }
-        // 兜底：用所有棋子的外接矩形
-        let xs = hits.map { $0.x / K }, ys = hits.map { $0.y / K }
-        if let x0 = xs.min(), let x1 = xs.max(), let y0 = ys.min(), let y1 = ys.max(), x1 - x0 > 0.05, y1 - y0 > 0.05 {
-            let src = [CGPoint(x: x0, y: y0), CGPoint(x: x1, y: y0), CGPoint(x: x1, y: y1), CGPoint(x: x0, y: y1)]
-            if let h = homography(src: src, dst: dstGrid) { hyps.append(h) }
+        // 兜底：画面中央的几种大小
+        let W = imgW / K, H = imgH / K
+        for wf in [0.7, 0.8, 0.9, 0.98] {
+            let gw = wf * W, gh = gw * 9 / 8
+            if gh > 0.95 * H { continue }
+            let cx = W / 2, cy = H * 0.45
+            out.append([CGPoint(x: cx - gw / 2, y: cy - gh / 2), CGPoint(x: cx + gw / 2, y: cy - gh / 2),
+                        CGPoint(x: cx + gw / 2, y: cy + gh / 2), CGPoint(x: cx - gw / 2, y: cy + gh / 2)])
         }
-        var scored = hyps.map { ($0, score($0, hits).1) }
+        return out
+    }
+
+    /// 返回 (四角, 对比度, 质量=对比度/半格偏移基线)
+    static func detect(_ G: Gray, quads: [[CGPoint]], imgW: Double, imgH: Double) -> ([CGPoint], Double, Double)? {
+        let hyps = hypotheses(quads: quads, imgW: imgW, imgH: imgH)
+        var scored = hyps.map { ($0, objective(G, $0)) }
         scored.sort { $0.1 > $1.1 }
-        var best: [Double]? = nil
-        var bestTotal = Int.min
-        var bestInl = 0
-        for (h, _) in scored.prefix(5) {
-            let r = refine(h, hits)
-            let s = score(r, hits)
-            if s.1 > bestTotal { bestTotal = s.1; bestInl = s.0; best = r }
+        var bestC: [CGPoint]? = nil
+        var bestV = -1.0
+        for (c, _) in scored.prefix(6) {
+            let r = refine(G, c, step0: 0.02)
+            if r.1 > bestV { bestV = r.1; bestC = r.0 }
         }
-        guard let bh = best, bestInl >= 5, let inv = invert3(bh) else { return nil }
-        return (inv, bh)
+        guard let bc = bestC else { return nil }
+        let nullV = objective(G, bc, shift: 0.5)
+        let quality = bestV / max(nullV, 0.5)
+        if quality < 1.4 || bestV < 2.5 { return nil }
+        return (bc, bestV, quality)
     }
 }
 
-// MARK: - 图像处理：竖直化、透视校正、颜色判断
+// MARK: - 图像处理：竖直化、透视校正、格子特征
 
 final class Rectified {
     let cg: CGImage
     let rgba: [UInt8]
-    init(cg: CGImage, rgba: [UInt8]) { self.cg = cg; self.rgba = rgba }
+    let lum: [UInt8]
+    init(cg: CGImage, rgba: [UInt8], lum: [UInt8]) { self.cg = cg; self.rgba = rgba; self.lum = lum }
 }
 
 enum Analyzer {
@@ -473,11 +506,6 @@ enum Analyzer {
     /// 摄像头缓冲区是横向的，转成竖直（与竖屏预览一致）
     static func upright(_ pb: CVPixelBuffer) -> CGImage? {
         let ci = CIImage(cvPixelBuffer: pb).oriented(.right)
-        return ctx.createCGImage(ci, from: ci.extent)
-    }
-
-    static func rotated180(_ cg: CGImage) -> CGImage? {
-        let ci = CIImage(cgImage: cg).oriented(.down)
         return ctx.createCGImage(ci, from: ci.extent)
     }
 
@@ -510,7 +538,88 @@ enum Analyzer {
             return true
         }
         guard ok else { return nil }
-        return Rectified(cg: cg, rgba: data)
+        var lum = [UInt8](repeating: 0, count: W * H)
+        for i in 0..<(W * H) {
+            let pr: Int = Int(data[4 * i])
+            let pg: Int = Int(data[4 * i + 1])
+            let pbl: Int = Int(data[4 * i + 2])
+            let lv: Int = (299 * pr + 587 * pg + 114 * pbl) / 1000
+            lum[i] = UInt8(lv)
+        }
+        return Rectified(cg: cg, rgba: data, lum: lum)
+    }
+
+    /// "这个格子有棋子"的得分：中心圆盘与格子四角底色的色差 + 棋子边框处的暗/红像素比例
+    static func cellScore(_ R: Rectified, _ r: Int, _ c: Int) -> Float {
+        let cx = c * cell + cell / 2, cy = r * cell + cell / 2
+        var n1 = 0, dr = 0, dg = 0, db = 0
+        var nc = 0, cr = 0, cg2 = 0, cb = 0
+        var nr = 0, ink = 0
+        for dy in -47...47 {
+            for dx in -47...47 {
+                let d2 = dx * dx + dy * dy
+                let o = (cy + dy) * W + cx + dx
+                let p = o * 4
+                if d2 <= 676 {
+                    n1 += 1
+                    dr += Int(R.rgba[p]); dg += Int(R.rgba[p + 1]); db += Int(R.rgba[p + 2])
+                } else if d2 >= 1156 && d2 <= 1936 {
+                    nr += 1
+                    let rr = Int(R.rgba[p]), gg = Int(R.rgba[p + 1]), bb = Int(R.rgba[p + 2])
+                    let isRed: Bool = rr > 110 && rr > 2 * gg && rr > 2 * bb
+                    if isRed || Int(R.lum[o]) < 90 { ink += 1 }
+                }
+                if abs(dx) >= 36 && abs(dy) >= 36 {
+                    nc += 1
+                    cr += Int(R.rgba[p]); cg2 += Int(R.rgba[p + 1]); cb += Int(R.rgba[p + 2])
+                }
+            }
+        }
+        let a = Float(max(n1, 1)), b = Float(max(nc, 1))
+        let ex: Float = Float(dr) / a - Float(cr) / b
+        let ey: Float = Float(dg) / a - Float(cg2) / b
+        let ez: Float = Float(db) / a - Float(cb) / b
+        let sq: Float = ex * ex + ey * ey + ez * ez
+        let cdist: Float = sq.squareRoot() / 255
+        let ring: Float = Float(ink) / Float(max(nr, 1))
+        return cdist + 0.6 * ring
+    }
+
+    /// 格子中心 72x72 区域的 24x24 灰度描述子（圆形掩码，零均值、单位长度），用来认"见过的棋子"
+    static func descriptor(_ R: Rectified, _ r: Int, _ c: Int) -> [Float] {
+        let cx = c * cell + cell / 2, cy = r * cell + cell / 2
+        var d = [Float](repeating: 0, count: 576)
+        var mean: Float = 0, cnt: Float = 0
+        for j in 0..<24 {
+            for i in 0..<24 {
+                let ii = i - 12, jj = j - 12
+                if ii * ii + jj * jj > 144 { continue }
+                var s = 0
+                for yy in 0..<3 {
+                    for xx in 0..<3 {
+                        let x = cx - 36 + i * 3 + xx
+                        let y = cy - 36 + j * 3 + yy
+                        s += Int(R.lum[y * W + x])
+                    }
+                }
+                let v: Float = Float(s) / 9
+                d[j * 24 + i] = v
+                mean += v; cnt += 1
+            }
+        }
+        mean /= cnt
+        var nrm: Float = 0
+        for j in 0..<24 {
+            for i in 0..<24 {
+                let ii = i - 12, jj = j - 12
+                if ii * ii + jj * jj > 144 { continue }
+                d[j * 24 + i] -= mean
+                nrm += d[j * 24 + i] * d[j * 24 + i]
+            }
+        }
+        nrm = nrm.squareRoot()
+        if nrm > 1e-3 { for k in 0..<576 { d[k] /= nrm } }
+        return d
     }
 
     /// 格子里字的颜色：1 红, -1 黑, 0 不确定
@@ -519,16 +628,51 @@ enum Analyzer {
         var n = 0, red = 0, dark = 0
         for dy in -34...34 {
             for dx in -34...34 where dx * dx + dy * dy <= 1156 {
-                let p = ((cy + dy) * W + cx + dx) * 4
+                let o = (cy + dy) * W + cx + dx
+                let p = o * 4
                 let rr = Int(R.rgba[p]), gg = Int(R.rgba[p + 1]), bb = Int(R.rgba[p + 2])
-                let l = (299 * rr + 587 * gg + 114 * bb) / 1000
                 n += 1
-                if rr > 110 && rr > 2 * gg && rr > 2 * bb { red += 1 } else if l < 90 { dark += 1 }
+                let isRed: Bool = rr > 110 && rr > 2 * gg && rr > 2 * bb
+                if isRed { red += 1 } else if Int(R.lum[o]) < 90 { dark += 1 }
             }
         }
         let fr = Float(red) / Float(n), fd = Float(dark) / Float(n)
         if fr > 0.015 && fr * 3 > fd { return 1 }
         if fd > 0.02 { return -1 }
+        return 0
+    }
+
+    /// 单个格子放大、加白边后做文字识别（正着认一次，认不出再倒过来认一次）
+    static func paddedCrop(_ R: Rectified, _ r: Int, _ c: Int, rotate: Bool) -> CGImage? {
+        let rect = CGRect(x: c * cell, y: r * cell, width: cell, height: cell)
+        guard let crop = R.cg.cropping(to: rect) else { return nil }
+        let S = 288
+        guard let g = CGContext(data: nil, width: S, height: S, bitsPerComponent: 8, bytesPerRow: 0,
+                                space: CGColorSpaceCreateDeviceRGB(),
+                                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        g.setFillColor(UIColor.white.cgColor)
+        g.fill(CGRect(x: 0, y: 0, width: S, height: S))
+        if rotate {
+            g.translateBy(x: CGFloat(S) / 2, y: CGFloat(S) / 2)
+            g.rotate(by: .pi)
+            g.translateBy(x: -CGFloat(S) / 2, y: -CGFloat(S) / 2)
+        }
+        g.draw(crop, in: CGRect(x: 48, y: 48, width: 192, height: 192))
+        return g.makeImage()
+    }
+
+    /// 返回带符号的棋子编码（红正黑负），认不出返回 0
+    static func ocrCell(_ R: Rectified, _ r: Int, _ c: Int) -> Int {
+        for rot in [false, true] {
+            guard let img = paddedCrop(R, r, c, rotate: rot) else { continue }
+            let hits = OCR.run(img, minHeight: 0.1)
+            if let h = hits.max(by: { $0.conf < $1.conf }), h.conf >= 0.3 {
+                var side = h.side
+                if side == 0 { side = colorSide(R, c, r) }
+                if side == 0 { continue }
+                return side * h.type
+            }
+        }
         return 0
     }
 }
@@ -539,87 +683,148 @@ struct Recognition {
     var viewBoard: [Int8]      // 摄像头里看到的方向
     var board: [Int8]          // 规范方向（红下黑上）
     var flipped: Bool          // 摄像头里红方在上
+    var unknown: [Int]         // 有棋子但认不出的格子（视图索引）
     var g2i: [Double]          // 网格 -> 竖直图像 (k-px)
     var imgW: Double
     var imgH: Double
     var count: Int
+    var info: String
 }
 
-enum Recognizer {
-    /// cache：已找到的棋盘几何；识别质量差时清空以便下次重新找棋盘
-    static func run(_ pb: CVPixelBuffer, cache: inout [Double]?) -> Recognition? {
+final class Recognizer {
+    // 仅摄像头线程使用
+    private var corners: [CGPoint]? = nil
+    private var baseObj = 0.0
+    // 主线程 / 摄像头线程共用，加锁
+    private let lock = NSLock()
+    private var bank: [(code: Int, d: [Float])] = []
+    private var lastDescs: [Int: [Float]] = [:]
+
+    private func dot(_ a: [Float], _ b: [Float]) -> Float {
+        var s: Float = 0
+        for k in 0..<a.count { s += a[k] * b[k] }
+        return s
+    }
+
+    private func matchBank(_ d: [Float]) -> (Int, Float)? {
+        lock.lock()
+        defer { lock.unlock() }
+        var bc = 0
+        var bs: Float = -2
+        for e in bank {
+            let s = dot(e.d, d)
+            if s > bs { bs = s; bc = e.code }
+        }
+        return bs > -2 ? (bc, bs) : nil
+    }
+
+    private func learn(_ code: Int, _ d: [Float]) {
+        lock.lock()
+        defer { lock.unlock() }
+        for e in bank where e.code == code && dot(e.d, d) > 0.97 { return }
+        bank.append((code, d))
+        if bank.count > 300 { bank.removeFirst(bank.count - 300) }
+    }
+
+    /// 用户在画面上点格子纠正：记住这个外观对应的棋子（并清掉与之冲突的旧记忆）
+    func teach(viewIdx: Int, code: Int) {
+        lock.lock()
+        let d = lastDescs[viewIdx]
+        lock.unlock()
+        guard let desc = d, code != 0 else { return }
+        lock.lock()
+        bank.removeAll { $0.code != code && dot($0.d, desc) > 0.85 }
+        lock.unlock()
+        learn(code, desc)
+    }
+
+    func run(_ pb: CVPixelBuffer, force: Bool) -> Recognition? {
+        let t0 = Date()
         guard let up = Analyzer.upright(pb) else { return nil }
         let imgW = Double(up.width), imgH = Double(up.height)
-        var g2i = cache
-        var pass1 = [Hit]()
+        let G = Gray(up, scale: 0.5)
+        if force { corners = nil }
 
-        if g2i == nil {
-            pass1 = OCR.run(up, minHeight: 0.008)
-            if let rot = Analyzer.rotated180(up) {      // 对面的棋子字是倒的
-                for h in OCR.run(rot, minHeight: 0.008) {
-                    var m = h
-                    m.x = imgW - h.x
-                    m.y = imgH - h.y
-                    pass1.append(m)
-                }
+        var curObj = 0.0
+        var quality = 0.0
+        if let c = corners {
+            // 跟踪：每秒在上次位置附近微调，手机轻微移动也能跟上
+            let r = Geo.refine(G, c, step0: 0.008)
+            if r.1 < 0.55 * baseObj { corners = nil } else {
+                corners = r.0
+                baseObj = max(baseObj, r.1)
+                curObj = r.1
             }
+        }
+        if corners == nil {
             let quads = OCR.rectangles(up)
-            guard let found = Geo.find(quads: quads, hits: pass1) else { return nil }
-            g2i = found.0
+            guard let d = Geo.detect(G, quads: quads, imgW: imgW, imgH: imgH) else { return nil }
+            corners = d.0
+            baseObj = d.1
+            curObj = d.1
+            quality = d.2
         }
-        guard let g = g2i, let R = Analyzer.rectify(up, g2i: g) else { cache = nil; return nil }
-
-        // 在校正后的棋盘图上再识别一遍（更清晰），同样正反各一次
-        let cw = Double(R.cg.width), ch = Double(R.cg.height)
-        var hits2 = OCR.run(R.cg, minHeight: 0.02)
-        if let rot = Analyzer.rotated180(R.cg) {
-            for h in OCR.run(rot, minHeight: 0.02) {
-                var m = h
-                m.x = cw - h.x
-                m.y = ch - h.y
-                hits2.append(m)
-            }
+        guard let cs = corners, let g2i = homography(src: Geo.gridCorners, dst: cs),
+              let R = Analyzer.rectify(up, g2i: g2i) else { corners = nil; return nil }
+        if quality == 0 {
+            let nullV = Geo.objective(G, cs, shift: 0.5)
+            quality = curObj / max(nullV, 0.5)
         }
 
-        var cells: [Int: Hit] = [:]
-        func put(_ idx: Int, _ h: Hit) {
-            if let o = cells[idx], o.conf >= h.conf { return }
-            cells[idx] = h
+        // 哪些格子有棋子：对 90 个格子的得分做两类聚类
+        var sc = [Float](repeating: 0, count: 90)
+        for r in 0..<10 {
+            for c in 0..<9 { sc[r * 9 + c] = Analyzer.cellScore(R, r, c) }
         }
-        var offSum = 0.0, offN = 0.0
-        let cellD = Double(Analyzer.cell)
-        for h in hits2 {
-            let cx = h.x / cellD - 0.5, cy = h.y / cellD - 0.5
-            let c = Int(cx.rounded()), r = Int(cy.rounded())
-            let dx = abs(cx - Double(c)), dy = abs(cy - Double(r))
-            if dx < 0.4 && dy < 0.4 && c >= 0 && c <= 8 && r >= 0 && r <= 9 {
-                put(r * 9 + c, h)
-                offSum += dx + dy
-                offN += 2
+        let lo = sc.min() ?? 0, hi = sc.max() ?? 0
+        var c0 = lo, c1 = hi
+        for _ in 0..<10 {
+            var s0: Float = 0, n0: Float = 0, s1: Float = 0, n1: Float = 0
+            for v in sc {
+                if abs(v - c0) <= abs(v - c1) { s0 += v; n0 += 1 } else { s1 += v; n1 += 1 }
             }
+            if n0 > 0 { c0 = s0 / n0 }
+            if n1 > 0 { c1 = s1 / n1 }
         }
-        if !pass1.isEmpty, let i2g = invert3(g) {
-            for h in pass1 {
-                let p = applyH(i2g, h.x / K, h.y / K)
-                let gx = Double(p.x), gy = Double(p.y)
-                if !gx.isFinite || !gy.isFinite { continue }
-                let c = Int(gx.rounded()), r = Int(gy.rounded())
-                if abs(gx - Double(c)) < 0.3 && abs(gy - Double(r)) < 0.3 && c >= 0 && c <= 8 && r >= 0 && r <= 9 {
-                    var m = h
-                    m.conf *= 0.9
-                    put(r * 9 + c, m)
+        let thr = c0 + 0.4 * (c1 - c0)
+        var occupied = [Int]()
+        if c1 - c0 > 0.12 {
+            for i in 0..<90 where sc[i] > thr { occupied.append(i) }
+        }
+
+        // 先用"见过的棋子"快速匹配，匹配不上的才做文字识别
+        var codes = [Int](repeating: 0, count: 90)
+        var descs: [Int: [Float]] = [:]
+        var todo = [Int]()
+        for i in occupied {
+            let d = Analyzer.descriptor(R, i / 9, i % 9)
+            descs[i] = d
+            if let m = matchBank(d), m.1 >= 0.8 { codes[i] = m.0 } else { todo.append(i) }
+        }
+        if !todo.isEmpty {
+            let todoList = todo
+            var res = [Int](repeating: 0, count: todoList.count)
+            res.withUnsafeMutableBufferPointer { buf in
+                guard let base = buf.baseAddress else { return }
+                DispatchQueue.concurrentPerform(iterations: todoList.count) { k in
+                    let i = todoList[k]
+                    base[k] = Analyzer.ocrCell(R, i / 9, i % 9)
                 }
             }
+            for (k, i) in todoList.enumerated() where res[k] != 0 {
+                codes[i] = res[k]
+                if let d = descs[i] { learn(res[k], d) }
+            }
         }
+        lock.lock()
+        lastDescs = descs
+        lock.unlock()
 
         var view = [Int8](repeating: 0, count: 90)
+        var unknown = [Int]()
         var count = 0
-        for (idx, h) in cells {
-            var side = h.side
-            if side == 0 { side = Analyzer.colorSide(R, idx % 9, idx / 9) }
-            if side == 0 { continue }
-            view[idx] = Int8(side * h.type)
-            count += 1
+        for i in occupied {
+            if codes[i] != 0 { view[i] = Int8(codes[i]); count += 1 } else { unknown.append(i) }
         }
 
         // 摄像头里红方在上就整盘旋转 180°
@@ -635,11 +840,13 @@ enum Recognizer {
             let ci = flipped ? (9 - r) * 9 + (8 - c) : i
             board[ci] = view[i]
         }
-
-        // 质量太差或网格偏移明显 -> 下次重新找棋盘
-        let avgOff = offN > 0 ? offSum / offN : 1.0
-        if count < 4 || avgOff > 0.2 { cache = nil } else { cache = g }
-        return Recognition(viewBoard: view, board: board, flipped: flipped, g2i: g,
-                           imgW: imgW, imgH: imgH, count: count)
+        let elapsed = Date().timeIntervalSince(t0)
+        var info = "识别 \(count) 子"
+        if !unknown.isEmpty { info += "，\(unknown.count) 个认不出" }
+        let qs = String(format: "%.1f", quality)
+        let es = String(format: "%.1f", elapsed)
+        info += " · 网格匹配 \(qs) · 用时 \(es)s"
+        return Recognition(viewBoard: view, board: board, flipped: flipped, unknown: unknown,
+                           g2i: g2i, imgW: imgW, imgH: imgH, count: count, info: info)
     }
 }

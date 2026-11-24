@@ -22,11 +22,13 @@ final class Model: ObservableObject {
     @Published var imgSize = CGSize.zero
     @Published var viewBoard = [Int8](repeating: 0, count: 90)
     @Published var viewFlipped = false
+    @Published var unknown: [Int] = []
     @Published var forceRedetect = false
     var editIdx = 0
+    var teachIdx = 0
 
     let cam = CameraService()
-    private var cache: [Double]? = nil          // 仅摄像头线程使用
+    private let recognizer = Recognizer()
     private var lastRun = Date.distantPast      // 仅摄像头线程使用
     private var pending: [Int8] = []
     private var stable = 0
@@ -46,15 +48,16 @@ final class Model: ObservableObject {
         if Date().timeIntervalSince(lastRun) < 1.0 { return }
         let s = DispatchQueue.main.sync { (live: live, force: forceRedetect) }
         guard s.live else { return }
-        if s.force {
-            cache = nil
-            DispatchQueue.main.async { self.forceRedetect = false }
-        }
-        var c = cache
-        let res = Recognizer.run(pb, cache: &c)
-        cache = c
+        if s.force { DispatchQueue.main.async { self.forceRedetect = false } }
+        let res = recognizer.run(pb, force: s.force)
         lastRun = Date()
         DispatchQueue.main.async { self.consider(res) }
+    }
+
+    /// 用户点了摄像头画面里的某个格子，告诉 App 这是什么棋子
+    func teach(_ viewIdx: Int, _ code: Int) {
+        recognizer.teach(viewIdx: viewIdx, code: code)
+        status = "已记住，下一秒生效"
     }
 
     // MARK: 识别结果（主线程）：连续 2 次一致才采纳
@@ -62,6 +65,7 @@ final class Model: ObservableObject {
     private func consider(_ r: Recognition?) {
         guard let r = r else {
             g2i = nil
+            unknown = []
             info = ""
             status = "没找到棋盘：让整个棋盘完整进入画面，尽量正对、光线均匀"
             return
@@ -70,7 +74,14 @@ final class Model: ObservableObject {
         imgSize = CGSize(width: r.imgW, height: r.imgH)
         viewBoard = r.viewBoard
         viewFlipped = r.flipped
-        info = "识别到 \(r.count) 个棋子"
+        unknown = r.unknown
+        info = r.info
+        if !r.unknown.isEmpty {
+            stable = 0
+            pending = []
+            status = "有 \(r.unknown.count) 个棋子认不出（黄色？）：点一下它，告诉我是什么棋子"
+            return
+        }
 
         if r.board == pending { stable += 1 } else { pending = r.board; stable = 1 }
         guard stable >= 2, r.board != pos.b else { return }
@@ -177,9 +188,11 @@ struct CameraPreview: UIViewRepresentable {
     let g2i: [Double]?
     let imgSize: CGSize
     let viewBoard: [Int8]
+    let unknown: [Int]
     let best: Move?
     let flipped: Bool
     let showLabels: Bool
+    let onTapCell: (Int) -> Void
 
     func makeUIView(context: Context) -> PreviewUIView {
         let v = PreviewUIView()
@@ -188,7 +201,8 @@ struct CameraPreview: UIViewRepresentable {
     }
 
     func updateUIView(_ v: PreviewUIView, context: Context) {
-        v.update(g2i: g2i, imgSize: imgSize, viewBoard: viewBoard, best: best,
+        v.onTapCell = onTapCell
+        v.update(g2i: g2i, imgSize: imgSize, viewBoard: viewBoard, unknown: unknown, best: best,
                  flipped: flipped, showLabels: showLabels)
     }
 }
@@ -304,12 +318,14 @@ struct EditorView: View {
 struct ContentView: View {
     @StateObject private var m = Model()
     @State private var showEditor = false
+    @State private var showTeach = false
 
     var body: some View {
         ZStack {
             CameraPreview(session: m.cam.session, g2i: m.g2i, imgSize: m.imgSize,
-                          viewBoard: m.viewBoard, best: m.best, flipped: m.viewFlipped,
-                          showLabels: m.showLabels)
+                          viewBoard: m.viewBoard, unknown: m.unknown, best: m.best, flipped: m.viewFlipped,
+                          showLabels: m.showLabels,
+                          onTapCell: { idx in m.teachIdx = idx; showTeach = true })
                 .ignoresSafeArea()
             VStack(spacing: 8) {
                 HStack(alignment: .top) {
@@ -355,5 +371,12 @@ struct ContentView: View {
         }
         .onAppear { m.cam.start() }
         .sheet(isPresented: $showEditor) { EditorView(m: m) }
+        .confirmationDialog("这个格子是什么棋子？", isPresented: $showTeach, titleVisibility: .visible) {
+            ForEach([1, 2, 3, 4, 5, 6, 7, -1, -2, -3, -4, -5, -6, -7], id: \.self) { code in
+                Button((code > 0 ? "红" : "黑") + pieceName(Int8(code))) {
+                    m.teach(m.teachIdx, code)
+                }
+            }
+        }
     }
 }
